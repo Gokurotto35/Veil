@@ -1,0 +1,148 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyc
+# Ignore runtime overlay and mods data, but allow Python source files
+injection/overlay/*
+!injection/overlay/
+!injection/overlay/*.py
+!injection/overlay/__init__.py
+injection/mods/*
+!injection/mods/
+!injection/mods/*.py
+!injection/mods/__init__.py
+skins/*
+logs/*
+
+# Installer artifacts
+build/
+develop-eggs/
+dist/
+dist_updater/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+*.csv
+MANIFEST
+
+# PyInstaller / Nuitka build outputs
+main.build/
+main.dist/
+main.exe
+main.bin
+updater.exe
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE / Editor
+.vscode/
+.idea/
+.claude/settings.local.json
+
+# Local / temp
+vibeship-ai-fix-prompt-383e53c2-917d-4722-b35e-0f17148c8af5.txt
+temp_fix.txt
+build_local_sign.ps1
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Application specific
+# Note: injection/mods/ and injection/overlay/ Python source files are tracked
+# Only runtime data in these directories is ignored (see Python section above)
+injection/tools/hashes.game.txt
+
+state/*.json
+state/*.lock
+*.log
+logs/
+
+# Allow Pengu Loader assets to be tracked
+!Pengu Loader/**
+# Pengu Loader is rebuilt from the vendored source during every packaged build.
+Pengu Loader/Pengu Loader.exe
+Pengu Loader/Pengu Loader.exe.config
+Pengu Loader/core.dll
+vendor/PenguLoader-1.1.6/core/obj/
+vendor/PenguLoader-1.1.6/loader/bin/
+vendor/PenguLoader-1.1.6/loader/obj/
+vendor/PenguLoader-1.1.6/plugins/node_modules/
+vendor/PenguLoader-1.1.6/plugins/dist/
+vendor/PenguLoader-1.1.6/bin/
+# Installer
+installer/
+Output/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+
+license.dat
+config.ini
+injection/tools/hashes.game.txt
+Pengu Loader/datastore
+injection/tools/.hashes_state.json
+
+chroma_issue.txt
+CLAUDE.md
+injection/tools/ltk_patcher_host.exe
+injection/tools/ltk_patcher_dll.dll
+Pengu Loader/pengu.log
+*.log.old
+
+# Test artifacts
+test_party_punch.py
+test_party_relay.py
+Veil_PunchTest*.spec
+Veil_PartyTest.spec
+relay_server.py
+
+# Relay config (contains Worker URL — keep secret)
+party/network/relay_config.py
+
+# Cython build artifacts
+*.pyd
+*.c
+!native/**/*.c
+*.py.bak
+_cython_setup.py
+
+# Workers (deployed separately to Cloudflare)
+relay-worker/node_modules/
+skin-key-worker/node_modules/
+relay-worker/.wrangler/
+
+# Local test suites
+/test/
+injection/tools/cslol-dll.dll
+injection/tools/cslol-dll.stub
+
+# Working notes (spec, plan), kept out of the repository
+docs/superpowers/

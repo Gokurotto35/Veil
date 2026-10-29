@@ -1,0 +1,258 @@
+"""
+Native Win32 startup dialog used to prepare Veil before launching.
+
+This replaces the former PyQt-based launcher with a lightweight Steam-style
+progress window that:
+    1. Checks for application updates and applies them if needed.
+    2. Verifies local skin data and downloads missing content.
+
+Once all checks succeed, the dialog closes automatically and the main
+application continues bootstrapping.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import threading
+import time
+from contextlib import contextmanager
+from typing import Callable, Iterator
+
+from utils.core.logging import get_logger, get_named_logger
+from utils.system.win32_base import (
+    WM_CLOSE,
+    SW_SHOWNORMAL,
+    user32,
+)
+
+from ..ui.update_dialog import UpdateDialog
+from ..update.update_sequence import UpdateSequence
+from ..sequences.hash_check_sequence import HashCheckSequence
+from ..sequences.skin_sync_sequence import SkinSyncSequence
+
+log = get_logger()
+updater_log = get_named_logger("updater", prefix="log_updater")
+
+
+@contextmanager
+def _route_logger(source: logging.Logger, target: logging.Logger) -> Iterator[None]:
+    """Temporarily write *source* records through *target*'s handlers."""
+    added = [handler for handler in target.handlers if handler not in source.handlers]
+    previous_level = source.level
+    for handler in added:
+        source.addHandler(handler)
+    # Only open the level up to DEBUG; a logger already at TRACE (debug log mode) must keep TRACE records
+    if source.getEffectiveLevel() > logging.DEBUG:
+        source.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        for handler in added:
+            source.removeHandler(handler)
+        source.setLevel(previous_level)
+
+MB_ICONERROR = 0x00000010
+MB_ICONINFORMATION = 0x00000040
+MB_YESNO = 0x00000004
+MB_DEFBUTTON2 = 0x00000100
+MB_OK = 0x00000000
+MB_TOPMOST = 0x00040000
+IDYES = 6
+
+
+def _show_error(message: str) -> None:
+    """Show error dialog to user"""
+    try:
+        user32.MessageBoxW(
+            None,
+            message,
+            "Veil - Launcher",
+            MB_OK | MB_ICONERROR | MB_TOPMOST,
+        )
+        updater_log.error(f"Error dialog shown to user: {message}")
+    except Exception:
+        print(f"[Launcher] ERROR: {message}")
+        updater_log.exception("Failed to show error dialog", exc_info=True)
+
+
+def _with_ui_updates(dialog: UpdateDialog) -> tuple[Callable[[str], None], Callable[[int], None]]:
+    """Create UI update callbacks for dialog"""
+    def update_status(message: str) -> None:
+        dialog.set_status(message)
+        dialog.pump_messages()
+        updater_log.info(f"UI status update: {message}")
+
+    def update_progress(value: int) -> None:
+        dialog.set_progress(value)
+        dialog.pump_messages()
+        updater_log.debug(f"UI progress update: {value}%")
+
+    return update_status, update_progress
+
+
+def _confirm_update(dialog: UpdateDialog, remote_version: str, local_version: str) -> bool:
+    """Ask whether the user wants to download an available Veil update."""
+    dialog.set_marquee(False)
+    dialog.set_detail("Update available")
+    dialog.set_status(f"Veil {remote_version} is ready to install.")
+    dialog.pump_messages()
+
+    message = (
+        f"A new version of Veil is available.\n\n"
+        f"Current version: {local_version}\n"
+        f"New version: {remote_version}\n\n"
+        "Do you want to download and install it now?"
+    )
+    result = user32.MessageBoxW(
+        dialog.hwnd or None,
+        message,
+        "Veil update available",
+        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2 | MB_TOPMOST,
+    )
+    accepted = result == IDYES
+    updater_log.info(
+        "Update prompt answered: %s (current=%s, available=%s).",
+        "accepted" if accepted else "declined",
+        local_version,
+        remote_version,
+    )
+
+    if accepted:
+        dialog.set_detail("Updating Veil...")
+        dialog.set_status("Downloading update...")
+    else:
+        dialog.set_detail("Update skipped")
+        dialog.set_status("Continuing startup...")
+    dialog.set_marquee(accepted)
+    dialog.pump_messages()
+    return accepted
+
+
+def _perform_update(dialog: UpdateDialog, dev_mode: bool = False) -> bool:
+    """Perform update check and installation
+    
+    Args:
+        dialog: UpdateDialog instance for UI updates
+        dev_mode: If True, skip update check (for development)
+    """
+    updater_log.info("Starting update check sequence.")
+    dialog.clear_transfer_text()
+    dialog.set_detail("Checking for updates…")
+    dialog.set_status("Contacting update server…")
+    dialog.set_marquee(True)
+    dialog.pump_messages()
+
+    status_cb, progress_cb = _with_ui_updates(dialog)
+    try:
+        sequence = UpdateSequence()
+        updated = sequence.perform_update(
+            status_cb,
+            lambda _: None,
+            bytes_callback=lambda downloaded, total: dialog.update_transfer_progress(downloaded, total),
+            dev_mode=dev_mode,
+            confirm_callback=lambda remote_version, local_version: _confirm_update(
+                dialog,
+                remote_version,
+                local_version,
+            ),
+        )
+        updater_log.info(f"Auto-update completed. Update installed: {updated}")
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"Auto-update failed: {exc}")
+        dialog.set_status(f"Update failed: {exc}")
+        dialog.set_marquee(False)
+        dialog.reset_progress()
+        dialog.clear_transfer_text()
+        dialog.pump_messages()
+        updater_log.exception("Auto-update raised an exception", exc_info=True)
+        return False
+
+    if updated:
+        dialog.set_status("Update installed. Restarting…")
+        dialog.set_progress(100)
+        dialog.pump_messages()
+        time.sleep(1.0)
+        # auto_update already launched the new process via batch file; exit current one
+        updater_log.info("Update applied successfully; exiting for restart.")
+        os._exit(0)
+
+    dialog.set_marquee(False)
+    dialog.reset_progress()
+    dialog.clear_transfer_text()
+    dialog.pump_messages()
+    updater_log.info("No update applied; continuing startup.")
+    return False
+
+
+def run_launcher(dev_mode: bool = False, test_download_fail: bool = False) -> None:
+    """Display the Win32 update dialog and perform startup checks.
+
+    Args:
+        dev_mode: If True, skip hash checks (for development)
+        test_download_fail: If True, force skin download to fail (for testing)
+    """
+    if sys.platform != "win32":
+        log.debug("Win32 launcher skipped on non-Windows platform.")
+        return
+
+    with _route_logger(log, updater_log):
+        _run_launcher_dialog(dev_mode, test_download_fail)
+
+
+def _run_launcher_dialog(dev_mode: bool, test_download_fail: bool) -> None:
+    updater_log.info("Launcher sequence starting.")
+    dialog = UpdateDialog()
+    try:
+        dialog.show_window(SW_SHOWNORMAL)
+        dialog.pump_messages()
+        updater_log.info("Update dialog displayed.")
+
+        result: dict[str, Exception] = {}
+        done_event = threading.Event()
+
+        def worker():
+            try:
+                _perform_update(dialog, dev_mode=dev_mode)
+
+                hash_sequence = HashCheckSequence()
+                hash_sequence.perform_hash_check(dialog, dev_mode=dev_mode)
+                
+                skin_sequence = SkinSyncSequence()
+                skin_sequence.perform_skin_sync(dialog, test_fail=test_download_fail)
+
+                dialog.set_detail("All checks complete.")
+                dialog.set_status("Launching Veil…")
+                dialog.set_progress(100)
+                dialog.pump_messages()
+                time.sleep(0.4)
+                updater_log.info("Launcher sequence completed successfully.")
+            except SystemExit:
+                updater_log.info("Launcher sequence exiting due to SystemExit (expected for update restart).")
+                raise
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = exc
+                log.error(f"Launcher error: {exc}", exc_info=True)
+                _show_error(f"Failed to prepare Veil:\n\n{exc}")
+                updater_log.exception("Launcher sequence crashed", exc_info=True)
+            finally:
+                dialog.allow_close()
+                if dialog.hwnd:
+                    user32.PostMessageW(dialog.hwnd, WM_CLOSE, 0, 0)
+                done_event.set()
+
+        worker_thread = threading.Thread(target=worker, name="LauncherWorker", daemon=True)
+        worker_thread.start()
+
+        while not done_event.is_set():
+            if not dialog.pump_messages(block=True):
+                break
+
+        worker_thread.join()
+
+        if "error" in result:
+            raise result["error"]
+    finally:
+        dialog.destroy_window()
+        updater_log.info("Update dialog resources released.")

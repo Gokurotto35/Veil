@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Party Token Encoding/Decoding
+Compact, shareable tokens for party connection establishment via WebSocket relay.
+"""
+
+import base64
+import secrets
+import struct
+import time
+import zlib
+from dataclasses import dataclass
+from typing import Optional
+
+from utils.core.logging import get_logger
+
+log = get_logger()
+
+# Token prefix for identification
+TOKEN_PREFIX = "VEIL:"
+# Token version (v2 = WebSocket relay, no IP/port needed)
+TOKEN_VERSION = 2
+# Veil 1.3.1 and older reject tokens older than this, so tokens are
+# re-encoded with a fresh timestamp whenever they're shown. Newer versions
+# accept any age: the party key is kept across sessions, so a token stays a
+# valid address for its owner's room.
+TOKEN_EXPIRY_SECONDS = 3600
+# Exact payload size of each token version, before compression
+TOKEN_PAYLOAD_SIZES = {1: 57, 2: 45}
+# A real token is under 100 characters (a v1 payload that zlib can't shrink
+# encodes to 91, plus the prefix). Anything far longer is not a token, and a
+# pasted one is decompressed on the bridge loop: refuse it before decoding
+MAX_TOKEN_LENGTH = 160
+
+
+@dataclass
+class PartyToken:
+    """Party connection token containing info needed to connect via relay.
+
+    v2 format: no IP/port fields since relay handles connectivity.
+    Only summoner_id + encryption_key are needed.
+    """
+
+    summoner_id: int            # League summoner ID
+    encryption_key: bytes       # 32-byte encryption key
+    timestamp: int              # Token creation time (Unix timestamp)
+    version: int = TOKEN_VERSION
+
+    def encode(self) -> str:
+        """Encode token to compact base64 string.
+
+        Format (binary, before compression):
+        - version (1 byte)
+        - timestamp (4 bytes, uint32)
+        - summoner_id (8 bytes, uint64)
+        - encryption_key (32 bytes)
+
+        Total: 45 bytes before compression
+
+        Returns:
+            String like "VEIL:abc123..." suitable for sharing
+        """
+        try:
+            data = struct.pack(
+                ">BIQ",
+                self.version,
+                self.timestamp,
+                self.summoner_id,
+            )
+            data += self.encryption_key
+
+            compressed = zlib.compress(data, level=9)
+            encoded = base64.urlsafe_b64encode(compressed).decode("ascii")
+            encoded = encoded.rstrip("=")
+
+            return TOKEN_PREFIX + encoded
+
+        except Exception as e:
+            log.error(f"[TOKEN] Failed to encode token: {e}")
+            raise ValueError(f"Token encoding failed: {e}")
+
+    @classmethod
+    def decode(cls, token_str: str) -> "PartyToken":
+        """Decode token from base64 string.
+
+        Supports both v1 (legacy P2P with IP/port) and v2 (relay-only) tokens.
+
+        Args:
+            token_str: Token string (with or without VEIL: prefix)
+
+        Returns:
+            PartyToken instance
+
+        Raises:
+            ValueError: If token is invalid
+        """
+        try:
+            if len(token_str) > MAX_TOKEN_LENGTH:
+                raise ValueError("Token is too long")
+            if token_str.startswith(TOKEN_PREFIX):
+                token_str = token_str[len(TOKEN_PREFIX):]
+
+            padding = 4 - (len(token_str) % 4)
+            if padding != 4:
+                token_str += "=" * padding
+
+            compressed = base64.urlsafe_b64decode(token_str.encode("ascii"))
+            data = cls._decompress(compressed)
+
+            version = data[0]
+            if TOKEN_PAYLOAD_SIZES.get(version) != len(data):
+                if version not in TOKEN_PAYLOAD_SIZES:
+                    raise ValueError(f"Unsupported token version: {version}")
+                raise ValueError(f"Token data has the wrong size for v{version}")
+
+            if version == 1:
+                # Legacy v1 token: has IP/port fields
+                _, timestamp, summoner_id, _, _ = struct.unpack(">BIQHH", data[:17])
+                encryption_key = data[25:57]
+            else:
+                # v2 token: relay-only, no IP/port
+                _, timestamp, summoner_id = struct.unpack(">BIQ", data[:13])
+                encryption_key = data[13:45]
+
+            if len(encryption_key) != 32:
+                raise ValueError("Invalid encryption key length")
+
+            return cls(
+                version=version,
+                timestamp=timestamp,
+                summoner_id=summoner_id,
+                encryption_key=encryption_key,
+            )
+
+        except zlib.error as e:
+            raise ValueError(f"Token decompression failed: {e}")
+        except ValueError:
+            raise
+        except Exception as e:
+            log.error(f"[TOKEN] Failed to decode token: {e}")
+            raise ValueError(f"Token decoding failed: {e}")
+
+    @staticmethod
+    def _decompress(compressed: bytes) -> bytes:
+        """Inflate a token payload, never past the largest known payload size.
+
+        The stream must end exactly where the data does: a truncated stream,
+        or bytes after its end, is not a token Veil made.
+        """
+        limit = max(TOKEN_PAYLOAD_SIZES.values())
+        inflater = zlib.decompressobj()
+        data = inflater.decompress(compressed, limit + 1)
+        if len(data) > limit or inflater.unconsumed_tail:
+            raise ValueError("Token data too long")
+        if not inflater.eof:
+            raise ValueError("Token data is truncated")
+        if inflater.unused_data:
+            raise ValueError("Token has trailing data")
+        if not data:
+            raise ValueError("Token data too short")
+        return data
+
+    def is_expired(self) -> bool:
+        return time.time() > (self.timestamp + TOKEN_EXPIRY_SECONDS)
+
+    def time_until_expiry(self) -> int:
+        return int(self.timestamp + TOKEN_EXPIRY_SECONDS - time.time())
+
+    def __str__(self) -> str:
+        expiry = self.time_until_expiry()
+        expiry_str = f"{expiry}s" if expiry > 0 else "EXPIRED"
+        return f"PartyToken(summoner={self.summoner_id}, expires_in={expiry_str})"
+
+
+def create_token(
+    summoner_id: int,
+    encryption_key: Optional[bytes] = None,
+) -> PartyToken:
+    """Create a new party token.
+
+    Args:
+        summoner_id: League summoner ID
+        encryption_key: Optional 32-byte key (generated if not provided)
+
+    Returns:
+        PartyToken instance
+    """
+    if encryption_key is None:
+        encryption_key = secrets.token_bytes(32)
+
+    return PartyToken(
+        summoner_id=summoner_id,
+        encryption_key=encryption_key,
+        timestamp=int(time.time()),
+    )
